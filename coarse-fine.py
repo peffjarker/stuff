@@ -20,16 +20,15 @@ import concurrent.futures
 # ======================
 # CONFIGURATION
 # ======================
-ALPACA_API_KEY = 'PK8DPGKPJLXDYXHZYR7S'
-ALPACA_SECRET_KEY = 'o5UibXlKY3VTn5XP6JTQNye2HNbonThpzd6tuUdp'
-DEFAULT_SYMBOL = 'MU'
+ALPACA_API_KEY = 'PKYRJ7EDWUB6SLBS9XV5'
+ALPACA_SECRET_KEY = 'uBuv3cZRY3jsEsNkiK6dbmJHqbN83brmLbtMlip2'
+DEFAULT_SYMBOL = 'SPY'
 TRADE_QTY = 100
-RSI_PERIOD = 5
-MA_PERIOD = 10
-BUFFER_SIZE = max(RSI_PERIOD + 1, MA_PERIOD)
+DEFAULT_RSI_PERIOD = 7
+DEFAULT_MA_PERIOD = 10
 TIMEFRAME = TimeFrame.Minute
 POLL_INTERVAL = 1
-COOLDOWN = 60
+COOLDOWN = 10
 MAX_WORKERS = 10
 
 # ======================
@@ -52,9 +51,7 @@ HISTORICAL_DATA_CLIENT = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET
 # ======================
 # THREAD-SAFE HISTORICAL DATA CACHE AND PER-KEY LOCKS
 # ======================
-# Cache keyed by (symbol, start_str, end_str)
 HISTORICAL_DATA_CACHE: Dict[Tuple[str, str, str], List[Tuple[datetime, float]]] = {}
-# Global lock protecting the overall cache dictionary and a per-key-locks dictionary.
 GLOBAL_CACHE_LOCK = threading.Lock()
 CACHE_KEY_LOCKS: Dict[Tuple[str, str, str], threading.Lock] = {}
 
@@ -72,14 +69,11 @@ def get_lock_for_key(key: Tuple[str, str, str]) -> threading.Lock:
 
 def get_cached_historical_data(symbol: str, start: datetime, end: datetime) -> Optional[List[Tuple[datetime, float]]]:
     key = get_cache_key(symbol, start, end)
-    # First, check the cache quickly.
     with GLOBAL_CACHE_LOCK:
         if key in HISTORICAL_DATA_CACHE:
             return HISTORICAL_DATA_CACHE[key]
-    # Now acquire the per-key lock.
     key_lock = get_lock_for_key(key)
     with key_lock:
-        # Check again—another thread might have fetched the data while we waited.
         with GLOBAL_CACHE_LOCK:
             if key in HISTORICAL_DATA_CACHE:
                 return HISTORICAL_DATA_CACHE[key]
@@ -90,7 +84,7 @@ def get_cached_historical_data(symbol: str, start: datetime, end: datetime) -> O
                 start=start,
                 end=end,
                 adjustment='raw',
-                feed='iex'
+                feed='sip'
             )
             data_response = HISTORICAL_DATA_CLIENT.get_stock_bars(request).data
             if symbol not in data_response:
@@ -110,7 +104,10 @@ def get_cached_historical_data(symbol: str, start: datetime, end: datetime) -> O
 # DATA BUFFER CLASS
 # ======================
 class RSIBuffer:
-    def __init__(self):
+    def __init__(self, rsi_period: int = DEFAULT_RSI_PERIOD, ma_period: int = DEFAULT_MA_PERIOD):
+        self.rsi_period = rsi_period
+        self.ma_period = ma_period
+        self.buffer_size = max(rsi_period + 1, ma_period)
         self.prices = []
         self.lock = threading.Lock()
         self.avg_gain = None
@@ -121,34 +118,34 @@ class RSIBuffer:
 
     def add_historical_bars(self, bars):
         with self.lock:
-            self.prices = [bar.close for bar in bars[-BUFFER_SIZE:]]
-            if len(self.prices) >= RSI_PERIOD + 1:
+            self.prices = [bar.close for bar in bars[-self.buffer_size:]]
+            if len(self.prices) >= self.rsi_period + 1:
                 self._calculate_rsi()
 
     def update(self, price):
         with self.lock:
             self.latest_price = price
-            if len(self.prices) < BUFFER_SIZE:
+            if len(self.prices) < self.buffer_size:
                 self.prices.append(price)
             else:
                 self.prices = self.prices[1:] + [price]
-            if len(self.prices) >= RSI_PERIOD + 1:
+            if len(self.prices) >= self.rsi_period + 1:
                 self._calculate_rsi()
 
     def _calculate_rsi(self):
         self.previous_rsi = self.last_rsi
-        if len(self.prices) < BUFFER_SIZE:
+        if len(self.prices) < self.buffer_size:
             return
         prices_array = np.array(self.prices)
         deltas = np.diff(prices_array)
         gains = np.where(deltas > 0, deltas, 0)
         losses = np.where(deltas < 0, -deltas, 0)
         if self.avg_gain is None or self.avg_loss is None:
-            self.avg_gain = np.mean(gains[-RSI_PERIOD:])
-            self.avg_loss = np.mean(losses[-RSI_PERIOD:])
+            self.avg_gain = np.mean(gains[-self.rsi_period:])
+            self.avg_loss = np.mean(losses[-self.rsi_period:])
         else:
-            self.avg_gain = (self.avg_gain * (RSI_PERIOD - 1) + gains[-1]) / RSI_PERIOD
-            self.avg_loss = (self.avg_loss * (RSI_PERIOD - 1) + losses[-1]) / RSI_PERIOD
+            self.avg_gain = (self.avg_gain * (self.rsi_period - 1) + gains[-1]) / self.rsi_period
+            self.avg_loss = (self.avg_loss * (self.rsi_period - 1) + losses[-1]) / self.rsi_period
         if self.avg_loss == 0:
             self.last_rsi = 100.0
         else:
@@ -156,8 +153,8 @@ class RSIBuffer:
             self.last_rsi = 100.0 - (100.0 / (1 + rs))
 
     def get_ma(self):
-        if len(self.prices) >= MA_PERIOD:
-            return sum(self.prices[-MA_PERIOD:]) / MA_PERIOD
+        if len(self.prices) >= self.ma_period:
+            return sum(self.prices[-self.ma_period:]) / self.ma_period
         return None
 
 # ======================
@@ -177,15 +174,12 @@ class BacktestResult:
     def add_trade(self, timestamp: datetime, side: str, price: float, quantity: int):
         self.trade_count += 1
         cost = quantity * price * (1 + self.commission)
-        # Update position and cash
         if side == OrderSide.BUY:
             self.cash -= cost
             self.current_position += quantity
         else:
             self.cash += cost
             self.current_position -= quantity
-
-        # Update portfolio value and track extremes without storing each trade.
         current_value = self.portfolio_value(price)
         self.last_portfolio_value = current_value
         self.max_portfolio_value = max(self.max_portfolio_value, current_value)
@@ -217,12 +211,14 @@ class RSITradingBot:
     def __init__(self, backtest_mode: bool = False,
                  backtest_start: Optional[datetime] = None,
                  backtest_end: Optional[datetime] = None,
-                 up_trend_rsi_entry: int = 40,
-                 down_trend_rsi_exit: int = 60,
-                 rsi_exit_level: int = 50,
+                 up_trend_rsi_entry: int = 31,
+                 down_trend_rsi_exit: int = 89,
+                 rsi_exit_level: int = 40,
                  verbose: bool = True,
                  color: str = "",
                  symbol: str = DEFAULT_SYMBOL,
+                 rsi_period: int = DEFAULT_RSI_PERIOD,
+                 ma_period: int = DEFAULT_MA_PERIOD,
                  preloaded_data: Optional[List[Tuple[datetime, float]]] = None):
         self.backtest_mode = backtest_mode
         self.backtest_result = BacktestResult() if backtest_mode else None
@@ -233,16 +229,18 @@ class RSITradingBot:
         self.verbose = verbose
         self.color = color
         self.symbol = symbol
+        self.rsi_period = rsi_period
+        self.ma_period = ma_period
 
         if not backtest_mode:
             self.trading_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
             self.data_stream = StockDataStream(ALPACA_API_KEY, ALPACA_SECRET_KEY)
 
-        self.buffer = RSIBuffer()
+        self.buffer = RSIBuffer(rsi_period=self.rsi_period, ma_period=self.ma_period)
         self.running = threading.Event()
         self.position_lock = threading.Lock()
         self.last_trade_time = 0
-        self.trading_allowed = False
+        self.trading_allowed = True
 
         if backtest_mode:
             if preloaded_data is not None:
@@ -420,7 +418,7 @@ class RSITradingBot:
             request = StockBarsRequest(
                 symbol_or_symbols=self.symbol,
                 timeframe=TIMEFRAME,
-                limit=MA_PERIOD * 2,
+                limit=self.ma_period * 2,
                 adjustment='raw'
             )
             data_response = HISTORICAL_DATA_CLIENT.get_stock_bars(request).data
@@ -446,9 +444,9 @@ class RSITradingBot:
 class ParameterOptimizer:
     """
     This class optimizes trading strategy parameters by running a backtest
-    over a specified date range and across multiple symbols for each combination in the provided grid.
-    The performance (using a weighted profit metric that accounts for drawdown) is recorded and
-    the best parameter combination (averaged across symbols) is returned.
+    over a specified date range. In this modified version, we process one stock
+    at a time. For each stock, all candidate parameter combinations are evaluated
+    concurrently before moving on to the next stock.
     """
     def __init__(self, backtest_start: datetime, backtest_end: datetime,
                  parameter_grid: Dict[str, List[int]], symbols: List[str]):
@@ -456,12 +454,11 @@ class ParameterOptimizer:
         self.backtest_end = backtest_end
         self.parameter_grid = parameter_grid
         self.symbols = symbols
-        self.results = []
+        self.results = {}
 
-    # Process a single symbol.
     def run_backtest_for_symbol(self, symbol: str, up_trend_rsi_entry: int,
-                                down_trend_rsi_exit: int, rsi_exit_level: int,
-                                color: str) -> Dict:
+                                  down_trend_rsi_exit: int, rsi_exit_level: int,
+                                  rsi_period: int, ma_period: int, color: str) -> Dict:
         historical_data = get_cached_historical_data(symbol, self.backtest_start, self.backtest_end)
         if historical_data is None:
             return {}
@@ -475,158 +472,66 @@ class ParameterOptimizer:
             verbose=False,
             color=color,
             symbol=symbol,
+            rsi_period=rsi_period,
+            ma_period=ma_period,
             preloaded_data=historical_data
         )
         bot.start()
         return bot.backtest_result.summary()
 
-    # Run backtests for all symbols.
-    def run_backtest_multi(self, up_trend_rsi_entry: int, down_trend_rsi_exit: int,
-                           rsi_exit_level: int, color: str) -> Dict:
-        summaries = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [
-                executor.submit(self.run_backtest_for_symbol, symbol,
-                                up_trend_rsi_entry, down_trend_rsi_exit, rsi_exit_level, color)
-                for symbol in self.symbols
-            ]
-            for future in concurrent.futures.as_completed(futures):
-                summary = future.result()
-                if summary:
-                    summaries.append(summary)
-        aggregated_summary = {
-            'total_trades': sum(s['total_trades'] for s in summaries),
-            'final_value': np.mean([s['final_value'] for s in summaries]),
-            'max_drawdown': np.mean([s['max_drawdown'] for s in summaries]),
-            'profit_factor': np.mean([s['profit_factor'] for s in summaries])
-        }
-        return aggregated_summary
-
-    def _compute_weighted_profit(self, summary: Dict, drawdown_weight: float = 1.0) -> float:
-        profit = summary.get('final_value', 0) - 10000
-        max_drawdown = summary.get('max_drawdown', 0)
-        return profit * (1 - drawdown_weight * max_drawdown)
-
-    def optimize(self, drawdown_weight: float = 1.0) -> Tuple[Dict[str, int], List[Dict]]:
-        best_params = None
-        best_weighted_profit = -float('inf')
-        tasks = []
+    def optimize_by_stock(self, drawdown_weight: float = 1.0) -> Tuple[Dict[str, Dict[str, int]], Dict[str, List[Dict]]]:
+        """
+        For each stock, concurrently evaluate every parameter combination.
+        Return a mapping of each symbol to its best parameter combination and detailed results.
+        """
+        best_params_by_stock = {}
+        results_by_stock = {}
         colors = ["\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"]
-        comb_index = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for entry in self.parameter_grid.get("up_trend_rsi_entry", [40]):
-                for exit_down in self.parameter_grid.get("down_trend_rsi_exit", [60]):
-                    for exit_rsi in self.parameter_grid.get("rsi_exit_level", [50]):
-                        color = colors[comb_index % len(colors)]
-                        comb_index += 1
-                        future = executor.submit(self.run_backtest_multi, entry, exit_down, exit_rsi, color)
-                        tasks.append((future, {
-                            "up_trend_rsi_entry": entry,
-                            "down_trend_rsi_exit": exit_down,
-                            "rsi_exit_level": exit_rsi
-                        }))
+
+        for symbol in self.symbols:
+            tasks = []
+            comb_index = 0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                for entry in self.parameter_grid.get("up_trend_rsi_entry", [40]):
+                    for exit_down in self.parameter_grid.get("down_trend_rsi_exit", [60]):
+                        for exit_rsi in self.parameter_grid.get("rsi_exit_level", [50]):
+                            for rsi_period in self.parameter_grid.get("rsi_period", [DEFAULT_RSI_PERIOD]):
+                                for ma_period in self.parameter_grid.get("ma_period", [DEFAULT_MA_PERIOD]):
+                                    color = colors[comb_index % len(colors)]
+                                    comb_index += 1
+                                    future = executor.submit(
+                                        self.run_backtest_for_symbol,
+                                        symbol,
+                                        entry, exit_down, exit_rsi,
+                                        rsi_period, ma_period, color
+                                    )
+                                    # print(future.result().get('final_value', 0))
+                                    tasks.append((future, {
+                                        "up_trend_rsi_entry": entry,
+                                        "down_trend_rsi_exit": exit_down,
+                                        "rsi_exit_level": exit_rsi,
+                                        "rsi_period": rsi_period,
+                                        "ma_period": ma_period
+                                    }))
+            best_weighted_profit = -float('inf')
+            best_params = None
+            stock_results = []
             for future, params in tasks:
                 summary = future.result()
                 profit = summary.get('final_value', 0) - 10000
-                weighted_profit = self._compute_weighted_profit(summary, drawdown_weight)
-                self.results.append({
-                    "up_trend_rsi_entry": params["up_trend_rsi_entry"],
-                    "down_trend_rsi_exit": params["down_trend_rsi_exit"],
-                    "rsi_exit_level": params["rsi_exit_level"],
+                weighted_profit = profit  # You can adjust this with additional weighting if needed.
+                stock_results.append({
+                    **params,
                     "summary": summary,
                     "profit": profit,
                     "weighted_profit": weighted_profit
                 })
                 if weighted_profit > best_weighted_profit:
                     best_weighted_profit = weighted_profit
-                    best_params = {
-                        "up_trend_rsi_entry": params["up_trend_rsi_entry"],
-                        "down_trend_rsi_exit": params["down_trend_rsi_exit"],
-                        "rsi_exit_level": params["rsi_exit_level"]
-                    }
-        return best_params, self.results
-
-    def optimize_coarse_fine(self, coarse_steps: Optional[Dict[str, int]] = None,
-                               fine_delta: Optional[Dict[str, int]] = None,
-                               drawdown_weight: float = 1.0) -> Tuple[Dict[str, int], Dict[str, List[Dict]]]:
-        if coarse_steps is None:
-            coarse_steps = {"up_trend_rsi_entry": 5, "down_trend_rsi_exit": 5, "rsi_exit_level": 3}
-        if fine_delta is None:
-            fine_delta = {"up_trend_rsi_entry": 4, "down_trend_rsi_exit": 4, "rsi_exit_level": 2}
-        coarse_grid = {}
-        for param, values in self.parameter_grid.items():
-            lower = min(values)
-            upper = max(values)
-            step = coarse_steps.get(param, 1)
-            coarse_grid[param] = list(range(lower, upper + 1, step))
-        coarse_results = []
-        tasks = []
-        comb_index = 0
-        colors = ["\033[91m", "\033[92m", "\033[93m", "\033[94m", "\033[95m", "\033[96m"]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for entry in coarse_grid["up_trend_rsi_entry"]:
-                for exit_down in coarse_grid["down_trend_rsi_exit"]:
-                    for exit_rsi in coarse_grid["rsi_exit_level"]:
-                        color = colors[comb_index % len(colors)]
-                        comb_index += 1
-                        future = executor.submit(self.run_backtest_multi, entry, exit_down, exit_rsi, color)
-                        tasks.append((future, {
-                            "up_trend_rsi_entry": entry,
-                            "down_trend_rsi_exit": exit_down,
-                            "rsi_exit_level": exit_rsi
-                        }))
-            for future, params in tasks:
-                summary = future.result()
-                profit = summary.get("final_value", 0) - 10000
-                weighted_profit = self._compute_weighted_profit(summary, drawdown_weight)
-                coarse_results.append({
-                    "up_trend_rsi_entry": params["up_trend_rsi_entry"],
-                    "down_trend_rsi_exit": params["down_trend_rsi_exit"],
-                    "rsi_exit_level": params["rsi_exit_level"],
-                    "summary": summary,
-                    "profit": profit,
-                    "weighted_profit": weighted_profit
-                })
-        best_coarse = max(coarse_results, key=lambda x: x["weighted_profit"])
-        fine_grid = {}
-        for param in self.parameter_grid:
-            lower_bound = min(self.parameter_grid[param])
-            upper_bound = max(self.parameter_grid[param])
-            best_val = best_coarse[param]
-            delta = fine_delta.get(param, 1)
-            fine_lower = max(lower_bound, best_val - delta)
-            fine_upper = min(upper_bound, best_val + delta)
-            fine_grid[param] = list(range(fine_lower, fine_upper + 1))
-        fine_results = []
-        tasks = []
-        comb_index = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            for entry in fine_grid["up_trend_rsi_entry"]:
-                for exit_down in fine_grid["down_trend_rsi_exit"]:
-                    for exit_rsi in fine_grid["rsi_exit_level"]:
-                        color = colors[comb_index % len(colors)]
-                        comb_index += 1
-                        future = executor.submit(self.run_backtest_multi, entry, exit_down, exit_rsi, color)
-                        tasks.append((future, {
-                            "up_trend_rsi_entry": entry,
-                            "down_trend_rsi_exit": exit_down,
-                            "rsi_exit_level": exit_rsi
-                        }))
-            for future, params in tasks:
-                summary = future.result()
-                profit = summary.get("final_value", 0) - 10000
-                weighted_profit = self._compute_weighted_profit(summary, drawdown_weight)
-                fine_results.append({
-                    "up_trend_rsi_entry": params["up_trend_rsi_entry"],
-                    "down_trend_rsi_exit": params["down_trend_rsi_exit"],
-                    "rsi_exit_level": params["rsi_exit_level"],
-                    "summary": summary,
-                    "profit": profit,
-                    "weighted_profit": weighted_profit
-                })
-        best_fine = max(fine_results, key=lambda x: x["weighted_profit"])
-        all_results = {"coarse": coarse_results, "fine": fine_results}
-        return best_fine, all_results
+                    best_params = params
+            best_params_by_stock[symbol] = best_params
+            results_by_stock[symbol] = stock_results
+        return best_params_by_stock, results_by_stock
 
 # ======================
 # MAIN EXECUTION
@@ -634,12 +539,12 @@ class ParameterOptimizer:
 def parse_args():
     parser = argparse.ArgumentParser(description="RSI Trading Bot")
     parser.add_argument('--backtest', action='store_true', help='Run backtest')
-    parser.add_argument('--optimize', action='store_true', help='Optimize parameters using coarse-fine search')
+    parser.add_argument('--optimize', action='store_true', help='Optimize parameters using stock-by-stock search')
     parser.add_argument('--start', type=str, help='Backtest start date in YYYY-MM-DD format')
     parser.add_argument('--end', type=str, help='Backtest end date in YYYY-MM-DD format')
     parser.add_argument('--drawdown_weight', type=float, default=1.0, help='Weighting factor for drawdown in the optimization score')
     parser.add_argument('--symbol', type=str, default=DEFAULT_SYMBOL, help='Stock symbol for backtest or live trading')
-    parser.add_argument('--symbols', type=str, default="MU,AAPL,GOOGL", help='Comma-separated list of symbols for optimization')
+    parser.add_argument('--symbols', type=str, default="SPY", help='Comma-separated list of symbols for optimization')
     return parser.parse_args()
 
 if __name__ == '__main__':
@@ -652,23 +557,24 @@ if __name__ == '__main__':
     elif args.optimize:
         start_date = datetime.strptime(args.start, '%Y-%m-%d')
         end_date = datetime.strptime(args.end, '%Y-%m-%d')
+        # Parameter grid includes candidate values for rsi_period and ma_period.
         parameter_grid = {
             "up_trend_rsi_entry": list(range(1, 40)),
             "down_trend_rsi_exit": list(range(55, 90)),
-            "rsi_exit_level": list(range(35, 66))
+            "rsi_exit_level": list(range(35, 66)),
+            "rsi_period": list(range(2, 14)),   # example range from 2 to 13
+            "ma_period": list(range(5, 50))       # example range from 5 to 49
         }
         symbols = [sym.strip() for sym in args.symbols.split(",")]
         optimizer = ParameterOptimizer(start_date, end_date, parameter_grid, symbols)
-        best_params, results = optimizer.optimize_coarse_fine(drawdown_weight=args.drawdown_weight)
-        print("Optimization Results (Coarse-Fine):")
-        print(f"Best Parameters: {best_params}")
-        print("\nDetailed Results:")
-        print("Coarse Search Results:")
-        for result in results["coarse"]:
-            print(result)
-        print("\nFine Search Results:")
-        for result in results["fine"]:
-            print(result)
+        best_params_by_stock, results_by_stock = optimizer.optimize_by_stock(drawdown_weight=args.drawdown_weight)
+        print("Optimization Results (Stock-by-Stock):")
+        for symbol in symbols:
+            print(f"\nSymbol: {symbol}")
+            print(f"Best Parameters: {best_params_by_stock[symbol]}")
+            print("Detailed Results:")
+            for result in results_by_stock[symbol]:
+                print(result)
     else:
         bot = RSITradingBot(backtest_mode=False, verbose=True, symbol=args.symbol)
         bot.start()
